@@ -1,0 +1,72 @@
+name: Destructuring regression validation
+on:
+  push:
+    branches: ['validation/destructuring-native*']
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container: ghcr.io/phpstan/turbo-build:gnu-php8.3
+    defaults:
+      run:
+        shell: bash
+    env:
+      COMPOSER_ALLOW_SUPERUSER: '1'
+      COMPOSER_MEMORY_LIMIT: '-1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 4
+          persist-credentials: false
+      - name: Install Composer and locked dependencies
+        run: |
+          curl -fsSL https://composer.github.io/installer.sig -o /tmp/composer-installer.sig
+          curl -fsSL https://getcomposer.org/installer -o /tmp/composer-setup.php
+          php -r 'if (!hash_equals(trim(file_get_contents("/tmp/composer-installer.sig")), hash_file("sha384", "/tmp/composer-setup.php"))) { exit(1); }'
+          php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
+          composer install --no-interaction --prefer-dist --no-progress
+          composer install --working-dir=tests --no-interaction --prefer-dist --no-progress
+      - name: Compare PHP and native parity with the base
+        run: |
+          cp src/Analyser/ExprHandler/AssignHandler.php /tmp/fixed-handler.php
+          cp turbo-ext/src/AssignHandler.cpp /tmp/fixed-handler.cpp
+          restore_handlers() {
+            cp /tmp/fixed-handler.php src/Analyser/ExprHandler/AssignHandler.php
+            cp /tmp/fixed-handler.cpp turbo-ext/src/AssignHandler.cpp
+          }
+          trap restore_handlers EXIT
+          git show e4f45f9:src/Analyser/ExprHandler/AssignHandler.php > src/Analyser/ExprHandler/AssignHandler.php
+          git show e4f45f9:turbo-ext/src/AssignHandler.cpp > turbo-ext/src/AssignHandler.cpp
+          base_status=0
+          php turbo-ext/bin/side-by-side.php > /tmp/parity-base.log 2>&1 || base_status=$?
+          restore_handlers
+          fixed_status=0
+          php turbo-ext/bin/side-by-side.php > /tmp/parity-fixed.log 2>&1 || fixed_status=$?
+          cat /tmp/parity-fixed.log
+          test "$base_status" = "$fixed_status"
+          diff -u /tmp/parity-base.log /tmp/parity-fixed.log
+          if [ "$fixed_status" != 0 ]; then
+            echo 'Parity diagnostics also occur on the unchanged base; no new diagnostics.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Full PHP test suite
+        run: php -d memory_limit=-1 tests/vendor/bin/paratest --runner WrapperRunner --no-coverage --processes=2
+      - name: Strict native build
+        run: make -C turbo-ext -j2 WARN_FLAGS="$(make -s -C turbo-ext print-warn-flags)"
+      - name: Differential smoke and signature checks
+        run: |
+          export TURBO_DLL="$PWD/turbo-ext/phpstan_turbo.so"
+          php -d extension="$TURBO_DLL" turbo-ext/tests/smoke.php
+          php -d extension="$TURBO_DLL" turbo-ext/tests/signature-parity.php
+          php -d extension="$TURBO_DLL" turbo-ext/tests/walk-trace.php --shards=1 tests/PHPStan/Analyser/nsrt/bug-15091.php
+      - name: Enable native extension for child processes
+        run: |
+          mkdir -p "$RUNNER_TEMP/turbo-ini"
+          printf 'extension=%s/turbo-ext/phpstan_turbo.so\nmemory_limit=-1\n' "$PWD" > "$RUNNER_TEMP/turbo-ini/extension.ini"
+          echo "PHP_INI_SCAN_DIR=:$RUNNER_TEMP/turbo-ini" >> "$GITHUB_ENV"
+      - name: Verify native code is active
+        run: |
+          php -r 'require "vendor/autoload.php"; PHPStan\Turbo\TurboExtensionEnabler::activateIfCompatible(); if (!PHPStan\Turbo\TurboExtensionEnabler::isActive() || !(new ReflectionMethod("PHPStan\\Analyser\\ScopeOps", "nodeKey"))->isInternal()) { exit(1); }'
+      - name: Full native test suite
+        run: php tests/vendor/bin/paratest --runner WrapperRunner --no-coverage --processes=2
